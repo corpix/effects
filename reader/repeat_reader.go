@@ -1,14 +1,14 @@
-package effects
+package reader
 
 import (
 	"io"
 )
 
-type RingReader struct {
+type RepeatReader struct {
 	buf []byte
 }
 
-func (r *RingReader) Read(buf []byte) (int, error) {
+func (r *RepeatReader) Read(buf []byte) (int, error) {
 	var (
 		n           int
 		copiedBytes int
@@ -25,8 +25,8 @@ func (r *RingReader) Read(buf []byte) (int, error) {
 	return copiedBytes, nil
 }
 
-func NewRingReader(buf []byte) io.Reader {
-	return &RingReader{
+func NewRepeatReader(buf []byte) io.Reader {
+	return &RepeatReader{
 		buf: buf,
 	}
 }
