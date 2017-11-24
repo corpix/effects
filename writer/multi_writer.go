@@ -7,10 +7,8 @@ import (
 
 // MultiWriter represents a dynamic list of Writer interfaces.
 type MultiWriter struct {
-	locker *sync.RWMutex
-
-	// FIXME: More effective solution?
-	writers []io.Writer
+	locker  *sync.RWMutex
+	writers []io.Writer // FIXME: More effective solution?
 }
 
 // Add adds a Writer to the MultiWriter.
@@ -63,14 +61,14 @@ func (w *MultiWriter) Has(c io.Writer) bool {
 }
 
 func (w *MultiWriter) Write(buf []byte) (int, error) {
-	w.locker.RLock()
-	defer w.locker.RUnlock()
-
 	var (
 		l   = len(buf)
 		n   int
 		err error
 	)
+
+	w.locker.RLock()
+	defer w.locker.RUnlock()
 
 	for _, v := range w.writers {
 		n, err = v.Write(buf)
