@@ -5,9 +5,9 @@ import (
 	"io"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/corpix/pool"
+	"github.com/corpix/time"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -351,23 +351,23 @@ func TestConcurrentMultiWriterErrorHandler(t *testing.T) {
 				name: "1",
 				data: []byte(tearsInRain),
 				buffers: []io.Writer{
-					failingWriter{0, NewErrScheduleTimeout(time.Duration(0))},
+					failingWriter{0, NewErrScheduleTimeout(time.Duration(0).Duration())},
 				},
 				errors: []error{
-					NewErrScheduleTimeout(time.Duration(0)),
+					NewErrScheduleTimeout(time.Duration(0).Duration()),
 				},
 			},
 			{
 				name: "4",
 				data: []byte(tearsInRain),
 				buffers: []io.Writer{
-					failingWriter{0, NewErrScheduleTimeout(time.Duration(0))},
+					failingWriter{0, NewErrScheduleTimeout(time.Duration(0).Duration())},
 					failingWriter{0, io.ErrShortWrite},
 					failingWriter{0, nil}, // XXX: 0 bytes wrote != len(data) -> io.ErrShortWrite
 					failingWriter{0, io.ErrUnexpectedEOF},
 				},
 				errors: []error{
-					NewErrScheduleTimeout(time.Duration(0)),
+					NewErrScheduleTimeout(time.Duration(0).Duration()),
 					io.ErrShortWrite,
 					io.ErrShortWrite,
 					io.ErrUnexpectedEOF,
