@@ -1,5 +1,7 @@
 package: github.com/corpix/effects
-import: []
+import:
+- package: github.com/corpix/pool
+- package: github.com/corpix/time
 testImport:
 - package: github.com/stretchr/testify
   subpackages:

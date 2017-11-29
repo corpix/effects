@@ -1,8 +1,10 @@
-hash: b3161be1ecdf57cf328127cb994d0832547ec3bafb707699cc3434eee4212c16
-updated: 2017-11-24T21:42:22.347906889Z
+hash: da965b662f2257339848f83890eaaeb21a7c61957ac40e5914fe6de6e5c38222
+updated: 2017-11-29T03:35:51.860700636Z
 imports:
 - name: github.com/corpix/pool
   version: 2396288b6b816f5330c0b92798177655e2509d06
+- name: github.com/corpix/time
+  version: 9adb218ff5319d3f3e3d5a44fe0cb5d4880762f4
 testImports:
 - name: github.com/davecgh/go-spew
   version: 04cdfd42973bb9c8589fd6a731800cf222fde1a9

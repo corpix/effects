@@ -4,9 +4,9 @@ import (
 	"context"
 	"io"
 	"sync"
-	"time"
 
 	"github.com/corpix/pool"
+	"github.com/corpix/time"
 )
 
 // ConcurrentMultiWriterConfig is a configuration for ConcurrentMultiWriter.
@@ -94,7 +94,7 @@ func (w *ConcurrentMultiWriter) newWork(buf []byte, v io.Writer, wg *sync.WaitGr
 			go w.handleWorkError(
 				wg,
 				v,
-				NewErrScheduleTimeout(w.Config.ScheduleTimeout),
+				NewErrScheduleTimeout(w.Config.ScheduleTimeout.Duration()),
 			)
 			return
 		default:
@@ -134,7 +134,7 @@ func (w *ConcurrentMultiWriter) Write(buf []byte) (int, error) {
 	for _, v := range w.writers {
 		ctx, cancel = context.WithTimeout(
 			context.Background(),
-			w.Config.ScheduleTimeout,
+			w.Config.ScheduleTimeout.Duration(),
 		)
 
 		w.pool.Feed <- pool.NewWork(
