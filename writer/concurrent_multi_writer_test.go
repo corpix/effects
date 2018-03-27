@@ -181,9 +181,7 @@ func TestConcurrentMultiWriterAddWrite(t *testing.T) {
 				defer w.Close()
 
 				for _, buf := range sample.buffers {
-					if !w.TryAdd(buf) {
-						panic("No available workers")
-					}
+					w.Add(buf)
 				}
 
 				for k, v := range sample.data {
@@ -285,9 +283,7 @@ func TestConcurrentMultiWriterAddWriteRemoveWrite(t *testing.T) {
 				defer w.Close()
 
 				for _, buf := range sample.buffers {
-					if !w.TryAdd(buf) {
-						panic("No available workers")
-					}
+					w.Add(buf)
 				}
 
 				for k, v := range sample.data {
