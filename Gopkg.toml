@@ -29,10 +29,6 @@
   branch = "master"
   name = "github.com/corpix/pool"
 
-[[constraint]]
-  branch = "master"
-  name = "github.com/corpix/time"
-
 [prune]
   go-tests = true
   unused-packages = true

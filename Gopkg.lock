@@ -8,12 +8,6 @@
   revision = "2396288b6b816f5330c0b92798177655e2509d06"
 
 [[projects]]
-  branch = "master"
-  name = "github.com/corpix/time"
-  packages = ["."]
-  revision = "9adb218ff5319d3f3e3d5a44fe0cb5d4880762f4"
-
-[[projects]]
   name = "github.com/davecgh/go-spew"
   packages = ["spew"]
   revision = "04cdfd42973bb9c8589fd6a731800cf222fde1a9"
@@ -31,6 +25,6 @@
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "047767add8eb0df6cfe275e625cea9fd7b01dfaa6db7fa02cf0dfe0602528cd7"
+  inputs-digest = "191f76997a616836c10c2b970228fc2dc0c42bb4777d8d4b6f0211ec976b3280"
   solver-name = "gps-cdcl"
   solver-version = 1
