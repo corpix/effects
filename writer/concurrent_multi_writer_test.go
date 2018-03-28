@@ -2,23 +2,24 @@ package writer
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/corpix/pool"
 	"github.com/stretchr/testify/assert"
-	"io/ioutil"
-	"sync/atomic"
 )
 
 var (
 	ConcurrentMultiWriterTestConfig = ConcurrentMultiWriterConfig{
-		Backlog: BacklogConfig{Size: 8, AddTimeout: 10 * time.Millisecond},
+		Backlog: BacklogConfig{Size: 0, AddTimeout: 10 * time.Millisecond},
 		Pool: pool.Config{
 			Workers:   512,
-			QueueSize: 512,
+			QueueSize: 0,
 		},
 	}
 	ConcurrentMultiWriterBenchConfig = ConcurrentMultiWriterConfig{
@@ -297,45 +298,66 @@ func TestConcurrentMultiWriterWriteErrors(t *testing.T) {
 	for _, errs := range []struct {
 		err     error
 		samples concurrentMultiWriterSamples
-		count   bool
 	}{
 		{
-			err:     NewErrBacklogOverflow(0, nil),
-			samples: smallSeriesSamples(newFailing(0, NewErrBacklogOverflow(0, nil))),
-			count:   true,
+			err:     NewErrWriter(errors.New("test"), nil),
+			samples: smallSeriesSamples(newFailing(0, errors.New("test"))),
 		},
 		{
-			err:     NewErrBacklogOverflow(0, nil),
-			samples: smallSeriesSamples(newSlow(5 * time.Millisecond)),
-			count:   false,
+			err: NewErrBacklogOverflow(0, nil),
+			samples: concurrentMultiWriterSamples{
+				// FIXME: Test with small values
+				{
+					name:    "2:2",
+					data:    replicateByteslice(2, []byte(tearsInRain)),
+					buffers: replicateWriter(2, newSlow(100*time.Millisecond)),
+				},
+				{
+					name:    "4:4",
+					data:    replicateByteslice(4, []byte(tearsInRain)),
+					buffers: replicateWriter(4, newSlow(100*time.Millisecond)),
+				},
+				{
+					name:    "10:512",
+					data:    replicateByteslice(10, []byte(tearsInRain)),
+					buffers: replicateWriter(512, newSlow(100*time.Millisecond)),
+				},
+			},
 		},
 	} {
 		for _, sample := range errs.samples {
 			t.Run(
 				fmt.Sprintf("%s %T", sample.name, errs.err),
 				func(t *testing.T) {
-					count := int32(0)
+					called := false
 					w := NewConcurrentMultiWriter(
 						ConcurrentMultiWriterTestConfig,
 						func(err error) {
-							atomic.AddInt32(&count, 1)
-							assert.IsType(t, NewErrWriter(errs.err, nil), err)
+							assert.IsType(t, errs.err, err)
+							called = true
 						},
 						sample.buffers...,
 					)
 					defer w.Close()
 
+					wg := &sync.WaitGroup{}
+					wg.Add(len(sample.data))
+
 					for _, v := range sample.data {
-						n, err := w.Write(v)
+						go func(v []byte) {
+							defer wg.Done()
 
-						assert.Equal(t, nil, err, sample.name)
-						assert.Equal(t, len(v), n, sample.name)
-						assert.Equal(t, 0, len(w.preempt))
+							n, err := w.Write(v)
+
+							assert.Equal(t, nil, err, sample.name)
+							assert.Equal(t, len(v), n, sample.name)
+						}(v)
 					}
 
-					if errs.count {
-						assert.Equal(t, int32(len(sample.data)*len(sample.buffers)), count)
-					}
+					wg.Wait()
+
+					assert.Equal(t, 0, len(w.preempt))
+					assert.Equal(t, len(sample.data) > 0 && len(sample.buffers) > 0, called)
 				},
 			)
 		}
