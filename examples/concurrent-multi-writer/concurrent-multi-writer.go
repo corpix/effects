@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"os"
+	"time"
 
 	"github.com/corpix/effects/writer"
 	"github.com/corpix/pool"
@@ -14,15 +14,13 @@ func main() {
 	var (
 		cmr = writer.NewConcurrentMultiWriter(
 			writer.ConcurrentMultiWriterConfig{
-				Backlog: 8,
+				Backlog: writer.BacklogConfig{Size: 8, AddTimeout: 10 * time.Millisecond},
 				Pool: pool.Config{
 					Workers:   128,
 					QueueSize: 8,
 				},
 			},
-			func(cmr *writer.ConcurrentMultiWriter, w io.Writer, err error) {
-				panic(err)
-			},
+			func(err error) { panic(err) },
 		)
 		buf = bytes.NewBuffer(nil)
 		msg = []byte("** hello **\n")

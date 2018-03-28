@@ -4,35 +4,51 @@ import (
 	"context"
 	"io"
 	"sync"
-	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/corpix/pool"
 )
 
 type writesStatus struct {
-	target  uint32
-	current uint32
-	done    chan struct{}
+	target  int32
+	current int32
+	wg      *sync.WaitGroup
+}
+
+type BacklogConfig struct {
+	// Size, determines how many writers could wait for free slots.
+	Size int `default:"64" validate:"required"`
+
+	// AddTimeout, determines how much time we could wait to write
+	// into particular writer queue(when out of backlog capacity).
+	// Error handler will be called if backlog queue is full and
+	// this time is out.
+	AddTimeout time.Duration `default:"50ms"`
 }
 
 // ConcurrentMultiWriterConfig is a configuration for ConcurrentMultiWriter.
 // Backlog is a size of the writer personal buffer(if writer is slow or so).
 // Pool is a configuration for github.com/corpix/pool
 type ConcurrentMultiWriterConfig struct {
-	Backlog int         `default:"64" validate:"required"`
-	Pool    pool.Config `default:"{\"Workers\": 1024, \"QueueSize\": 16}" validate:"required"`
+	// Backlog, writer backlog queue configuration.
+	Backlog BacklogConfig
+
+	// Pool consists of:
+	// Workers, determines how many writers we could serve.
+	// QueueSize, determines how many writes we could queue for each writer.
+	Pool pool.Config `default:"{\"Workers\": 1024, \"QueueSize\": 16}" validate:"required"`
 }
 
 // ConcurrentMultiWriter represents a dynamic list of Writer interfaces.
 type ConcurrentMultiWriter struct {
-	config         ConcurrentMultiWriterConfig
-	pool           *pool.Pool
-	writers        []*WriterChannel
-	writersLock    *sync.RWMutex
-	preemptionLock *sync.RWMutex
-	preemption     map[uintptr]*writesStatus
-	errorHandler   func(*ConcurrentMultiWriter, io.Writer, error)
+	config       ConcurrentMultiWriterConfig
+	pool         *pool.Pool
+	writers      []*WriterChannel
+	writersLock  *sync.RWMutex
+	preemptLock  *sync.RWMutex
+	preempt      map[uintptr]*sync.WaitGroup
+	errorHandler func(error)
 }
 
 // Add adds a Writer to the ConcurrentMultiWriter.
@@ -43,18 +59,17 @@ func (w *ConcurrentMultiWriter) Add(wr io.Writer) {
 		wc = NewWriterChannel(
 			wr,
 			// XXX: Closing in Remove()
-			make(chan *[]byte, w.config.Backlog),
+			make(chan *[]byte, w.config.Backlog.Size),
 		)
 	)
-
-	w.writersLock.Lock()
-	defer w.writersLock.Unlock()
 
 	w.pool.Feed <- pool.NewWork(
 		context.Background(),
 		w.channelWriterPump(wc),
 	)
 
+	w.writersLock.Lock()
+	defer w.writersLock.Unlock()
 	w.writers = append(w.writers, wc)
 }
 
@@ -64,12 +79,9 @@ func (w *ConcurrentMultiWriter) TryAdd(wr io.Writer) bool {
 		wc = NewWriterChannel(
 			wr,
 			// XXX: Closing in Remove()
-			make(chan *[]byte, w.config.Backlog),
+			make(chan *[]byte, w.config.Backlog.Size),
 		)
 	)
-
-	w.writersLock.Lock()
-	defer w.writersLock.Unlock()
 
 	select {
 	case w.pool.Feed <- pool.NewWork(
@@ -80,6 +92,34 @@ func (w *ConcurrentMultiWriter) TryAdd(wr io.Writer) bool {
 		return false
 	}
 
+	w.writersLock.Lock()
+	defer w.writersLock.Unlock()
+	w.writers = append(w.writers, wc)
+
+	return true
+}
+
+// TryAddWithTimeout try add a a Writer to the ConcurrentMultiWriter without blocking.
+func (w *ConcurrentMultiWriter) TryAddWithTimeout(wr io.Writer, timeout time.Duration) bool {
+	var (
+		wc = NewWriterChannel(
+			wr,
+			// XXX: Closing in Remove()
+			make(chan *[]byte, w.config.Backlog.Size),
+		)
+	)
+
+	select {
+	case w.pool.Feed <- pool.NewWork(
+		context.Background(),
+		w.channelWriterPump(wc),
+	):
+	case <-time.After(timeout):
+		return false
+	}
+
+	w.writersLock.Lock()
+	defer w.writersLock.Unlock()
 	w.writers = append(w.writers, wc)
 
 	return true
@@ -117,6 +157,11 @@ func (w *ConcurrentMultiWriter) RemoveAll() bool {
 	w.writersLock.Lock()
 	defer w.writersLock.Unlock()
 
+	return w.removeAll()
+}
+
+// removeAll removes all writers(not threadsafe).
+func (w *ConcurrentMultiWriter) removeAll() bool {
 	res := len(w.writers) > 0
 
 	for _, wr := range w.writers {
@@ -145,10 +190,10 @@ func (w *ConcurrentMultiWriter) Has(c io.Writer) bool {
 func (w *ConcurrentMultiWriter) channelWriterPump(wr *WriterChannel) pool.Executor {
 	return func(ctx context.Context) {
 		var (
-			n       int
-			buf     *[]byte
-			preempt *writesStatus
-			err     error
+			id  uintptr
+			n   int
+			buf *[]byte
+			err error
 		)
 
 	prelude:
@@ -164,28 +209,87 @@ func (w *ConcurrentMultiWriter) channelWriterPump(wr *WriterChannel) pool.Execut
 			return
 		}
 
+		id = uintptr(unsafe.Pointer(buf))
+
 		n, err = wr.Writer.Write(*buf)
 		if err != nil {
-			w.errorHandler(w, wr, err)
+			w.errorHandler(NewErrWriter(err, wr.Writer))
 			goto tail
 		}
 
 		if n < len(*buf) {
-			w.errorHandler(w, wr, io.ErrShortWrite)
+			w.errorHandler(NewErrWriter(io.ErrShortWrite, wr.Writer))
 			goto tail
 		}
 
 	tail:
-		w.preemptionLock.RLock()
-		preempt = w.preemption[uintptr(unsafe.Pointer(buf))]
-		atomic.AddUint32(&preempt.current, 1)
-		if atomic.CompareAndSwapUint32(&preempt.current, preempt.target, 0) {
-			close(preempt.done)
-		}
-		w.preemptionLock.RUnlock()
+		w.preemptLock.RLock()
+		w.preempt[id].Done()
+		w.preemptLock.RUnlock()
 
 		goto prelude
 	}
+}
+
+func (w *ConcurrentMultiWriter) deferErrorHadler(err error) func() {
+	return func() { w.errorHandler(err) }
+}
+
+func (w *ConcurrentMultiWriter) createPreemptWaitGroup(id uintptr, n int) *sync.WaitGroup {
+	w.preemptLock.Lock()
+	defer w.preemptLock.Unlock()
+
+	wg, ok := w.preempt[id]
+	if !ok {
+		wg = &sync.WaitGroup{}
+		w.preempt[id] = wg
+	}
+	if n > 0 {
+		w.preempt[id].Add(n)
+	}
+
+	return wg
+}
+
+func (w *ConcurrentMultiWriter) removePreemptWaitGroup(id uintptr) {
+	w.preemptLock.Lock()
+	defer w.preemptLock.Unlock()
+
+	delete(w.preempt, id)
+}
+
+func (w *ConcurrentMultiWriter) write(id uintptr, buf *[]byte) []func() {
+	var (
+		wg   *sync.WaitGroup
+		errs []func()
+	)
+
+	w.writersLock.RLock()
+	defer w.writersLock.RUnlock()
+
+	if len(w.writers) == 0 {
+		return nil
+	}
+
+	wg = w.createPreemptWaitGroup(id, len(w.writers))
+	defer w.removePreemptWaitGroup(id)
+	defer wg.Wait()
+
+	for _, wr := range w.writers {
+		select {
+		case wr.Channel <- buf:
+		case <-time.After(w.config.Backlog.AddTimeout):
+			wg.Done()
+			errs = append(
+				errs,
+				w.deferErrorHadler(
+					NewErrBacklogOverflow(w.config.Backlog.Size, wr),
+				),
+			)
+		}
+	}
+
+	return errs
 }
 
 // Write writes a buf to each concrete writer concurrently.
@@ -193,55 +297,12 @@ func (w *ConcurrentMultiWriter) channelWriterPump(wr *WriterChannel) pool.Execut
 // all data will be sent before return control.
 func (w *ConcurrentMultiWriter) Write(buf []byte) (int, error) {
 	var (
-		done        = make(chan struct{})
-		errHandlers []func()
+		id = uintptr(unsafe.Pointer(&buf))
 	)
 
-	w.writersLock.RLock()
-
-	if len(w.writers) == 0 {
-		w.writersLock.RUnlock()
-		return len(buf), nil
+	for _, handle := range w.write(id, &buf) {
+		handle()
 	}
-
-	status := &writesStatus{
-		target:  uint32(len(w.writers)),
-		current: 0,
-		done:    done,
-	}
-
-	w.preemptionLock.Lock()
-	w.preemption[uintptr(unsafe.Pointer(&buf))] = status
-	w.preemptionLock.Unlock()
-
-	for _, wr := range w.writers {
-		select {
-		case wr.Channel <- &buf:
-		default:
-			errHandlers = append(
-				errHandlers,
-				(func(wr io.Writer) func() {
-					return func() {
-						w.errorHandler(w, wr, NewErrBacklogOverflow(w.config.Backlog))
-					}
-				}(wr)),
-			)
-		}
-	}
-
-	w.writersLock.RUnlock()
-
-	if len(errHandlers) > 0 {
-		for _, errHandler := range errHandlers {
-			errHandler()
-		}
-	}
-
-	<-done
-
-	w.preemptionLock.Lock()
-	delete(w.preemption, uintptr(unsafe.Pointer(&buf)))
-	w.preemptionLock.Unlock()
 
 	return len(buf), nil
 }
@@ -249,29 +310,31 @@ func (w *ConcurrentMultiWriter) Write(buf []byte) (int, error) {
 func (w *ConcurrentMultiWriter) Close() error {
 	w.pool.Close()
 
-	w.preemptionLock.Lock()
-	defer w.preemptionLock.Unlock()
+	w.writersLock.Lock()
+	defer w.writersLock.Unlock()
 
-	for _, preempt := range w.preemption {
-		close(preempt.done)
+	w.preemptLock.RLock()
+	defer w.preemptLock.RUnlock()
+
+	for _, wg := range w.preempt {
+		wg.Wait()
 	}
-	w.preemption = nil
 
-	w.RemoveAll()
+	w.removeAll()
 
 	return nil
 }
 
 // NewConcurrentMultiWriter creates new Writer.
-func NewConcurrentMultiWriter(c ConcurrentMultiWriterConfig, errorHandler func(*ConcurrentMultiWriter, io.Writer, error), ws ...io.Writer) *ConcurrentMultiWriter {
+func NewConcurrentMultiWriter(c ConcurrentMultiWriterConfig, errorHandler func(error), ws ...io.Writer) *ConcurrentMultiWriter {
 	var (
 		w = &ConcurrentMultiWriter{
-			config:         c,
-			pool:           pool.NewFromConfig(c.Pool),
-			writersLock:    &sync.RWMutex{},
-			preemptionLock: &sync.RWMutex{},
-			preemption:     map[uintptr]*writesStatus{},
-			errorHandler:   errorHandler,
+			config:       c,
+			pool:         pool.NewFromConfig(c.Pool),
+			writersLock:  &sync.RWMutex{},
+			preemptLock:  &sync.RWMutex{},
+			preempt:      map[uintptr]*sync.WaitGroup{},
+			errorHandler: errorHandler,
 		}
 	)
 

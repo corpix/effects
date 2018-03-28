@@ -5,25 +5,27 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/corpix/pool"
 	"github.com/stretchr/testify/assert"
 	"io/ioutil"
+	"sync/atomic"
 )
 
 var (
 	ConcurrentMultiWriterTestConfig = ConcurrentMultiWriterConfig{
-		Backlog: 8, // How many writers could wait for free slots
+		Backlog: BacklogConfig{Size: 8, AddTimeout: 10 * time.Millisecond},
 		Pool: pool.Config{
-			Workers:   1024, // How many writers we could serve
-			QueueSize: 8,    // How many writes we could queue for each writer
+			Workers:   512,
+			QueueSize: 512,
 		},
 	}
 	ConcurrentMultiWriterBenchConfig = ConcurrentMultiWriterConfig{
-		Backlog: 64, // How many writers could wait for free slots
+		Backlog: BacklogConfig{Size: 64, AddTimeout: 10 * time.Millisecond},
 		Pool: pool.Config{
-			Workers:   12800, // How many writers we could serve
-			QueueSize: 1024,  // How many writes we could queue for each writer
+			Workers:   12048,
+			QueueSize: 1030,
 		},
 	}
 )
@@ -37,23 +39,21 @@ func (w failingWriter) Write([]byte) (int, error) {
 	return w.wrote, w.err
 }
 
-func replicateBuffers(n uint) []io.Writer {
-	var (
-		res = make([]io.Writer, n)
-	)
-	for k := uint(0); k < n; k++ {
-		res[k] = bytes.NewBuffer(nil)
-	}
-
-	return res
+type slowWriter struct {
+	sleep time.Duration
 }
 
-func replicateDiscard(n uint) []io.Writer {
+func (w slowWriter) Write(buf []byte) (int, error) {
+	time.Sleep(w.sleep)
+	return len(buf), nil
+}
+
+func replicateWriter(n uint, fn func() io.Writer) []io.Writer {
 	var (
 		res = make([]io.Writer, n)
 	)
 	for k := uint(0); k < n; k++ {
-		res[k] = ioutil.Discard
+		res[k] = fn()
 	}
 
 	return res
@@ -70,66 +70,194 @@ func replicateByteslice(n uint, buf []byte) [][]byte {
 	return res
 }
 
+func newBuffer() io.Writer  { return bytes.NewBuffer(nil) }
+func newDiscard() io.Writer { return ioutil.Discard }
+func newFailing(wrote int, err error) func() io.Writer {
+	return func() io.Writer { return &failingWriter{wrote, err} }
+}
+func newSlow(sleep time.Duration) func() io.Writer {
+	return func() io.Writer { return &slowWriter{sleep} }
+}
+
 type concurrentMultiWriterSamples []struct {
 	name    string
 	data    [][]byte
 	buffers []io.Writer
 }
 
-func smallSeriesSamples() concurrentMultiWriterSamples {
+func smallSeriesSamples(replicator func() io.Writer) concurrentMultiWriterSamples {
 	return concurrentMultiWriterSamples{
 		{
 			name:    "0:0",
 			data:    replicateByteslice(0, []byte(tearsInRain)),
-			buffers: replicateBuffers(0),
+			buffers: replicateWriter(0, replicator),
 		},
 		{
 			name:    "0:1",
 			data:    replicateByteslice(0, []byte(tearsInRain)),
-			buffers: replicateBuffers(1),
+			buffers: replicateWriter(1, replicator),
 		},
 		{
 			name:    "1:0",
 			data:    replicateByteslice(1, []byte(tearsInRain)),
-			buffers: replicateBuffers(0),
+			buffers: replicateWriter(0, replicator),
 		},
 		{
 			name:    "1:1",
 			data:    replicateByteslice(1, []byte(tearsInRain)),
-			buffers: replicateBuffers(1),
+			buffers: replicateWriter(1, replicator),
 		},
 		{
 			name:    "1:2",
 			data:    replicateByteslice(1, []byte(tearsInRain)),
-			buffers: replicateBuffers(2),
+			buffers: replicateWriter(2, replicator),
 		},
 		{
 			name:    "2:1",
 			data:    replicateByteslice(2, []byte(tearsInRain)),
-			buffers: replicateBuffers(1),
+			buffers: replicateWriter(1, replicator),
 		},
 		{
 			name:    "2:2",
 			data:    replicateByteslice(2, []byte(tearsInRain)),
-			buffers: replicateBuffers(2),
+			buffers: replicateWriter(2, replicator),
 		},
 		{
 			name:    "4:4",
 			data:    replicateByteslice(4, []byte(tearsInRain)),
-			buffers: replicateBuffers(4),
+			buffers: replicateWriter(4, replicator),
 		},
 		{
-			// FIXME: Big numbers leading to a deadlock
-			name:    "100:512",
-			data:    replicateByteslice(100, []byte(tearsInRain)),
-			buffers: replicateBuffers(512),
+			name:    "10:512",
+			data:    replicateByteslice(10, []byte(tearsInRain)),
+			buffers: replicateWriter(512, replicator),
+		},
+	}
+}
+
+type benchmarkingMultiWriterSeriesSamples []struct {
+	name string
+	w    io.WriteCloser
+}
+
+func benchmarkingSeriesSamples(replicator func() io.Writer) benchmarkingMultiWriterSeriesSamples {
+	return benchmarkingMultiWriterSeriesSamples{
+		{
+			name: "none",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+			),
+		},
+		{
+			name: "1",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				replicateWriter(1, newDiscard)...,
+			),
+		},
+		{
+			name: "2",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				replicateWriter(2, newDiscard)...,
+			),
+		},
+		{
+			name: "3",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				replicateWriter(3, newDiscard)...,
+			),
+		},
+		{
+			name: "512",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				replicateWriter(512, newDiscard)...,
+			),
+		},
+		{
+			name: "2048",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				replicateWriter(2048, newDiscard)...,
+			),
+		},
+		{
+			name: "3072",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				replicateWriter(3072, newDiscard)...,
+			),
+		},
+		{
+			name: "3072:1 slow",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				append(
+					replicateWriter(3071, newDiscard),
+					replicateWriter(1, newSlow(500*time.Millisecond))...,
+				)...,
+			),
+		},
+		{
+			name: "3072:2 slow",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				append(
+					replicateWriter(3070, newDiscard),
+					replicateWriter(2, newSlow(500*time.Millisecond))...,
+				)...,
+			),
+		},
+		{
+			name: "3072:3 slow",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				append(
+					replicateWriter(3069, newDiscard),
+					replicateWriter(3, newSlow(500*time.Millisecond))...,
+				)...,
+			),
+		},
+		{
+			name: "3072:512 slow",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				append(
+					replicateWriter(2560, newDiscard),
+					replicateWriter(512, newSlow(500*time.Millisecond))...,
+				)...,
+			),
+		},
+		{
+			name: "3072:2048 slow",
+			w: NewConcurrentMultiWriter(
+				ConcurrentMultiWriterBenchConfig,
+				func(err error) { panic(err) },
+				append(
+					replicateWriter(1024, newDiscard),
+					replicateWriter(2048, newSlow(500*time.Millisecond))...,
+				)...,
+			),
 		},
 	}
 }
 
 func TestConcurrentMultiWriterWrite(t *testing.T) {
 	var (
-		samples = smallSeriesSamples()
+		samples = smallSeriesSamples(newBuffer)
 	)
 
 	for _, sample := range samples {
@@ -138,7 +266,7 @@ func TestConcurrentMultiWriterWrite(t *testing.T) {
 			func(t *testing.T) {
 				w := NewConcurrentMultiWriter(
 					ConcurrentMultiWriterTestConfig,
-					func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
+					func(err error) { panic(err) },
 					sample.buffers...,
 				)
 				defer w.Close()
@@ -149,7 +277,7 @@ func TestConcurrentMultiWriterWrite(t *testing.T) {
 
 					assert.Equal(t, nil, err, sample.name)
 					assert.Equal(t, len(v), n, sample.name)
-					assert.Equal(t, 0, len(w.preemption))
+					assert.Equal(t, 0, len(w.preempt))
 
 					for k, buf := range sample.buffers {
 						assert.Equal(
@@ -165,9 +293,58 @@ func TestConcurrentMultiWriterWrite(t *testing.T) {
 	}
 }
 
+func TestConcurrentMultiWriterWriteErrors(t *testing.T) {
+	for _, errs := range []struct {
+		err     error
+		samples concurrentMultiWriterSamples
+		count   bool
+	}{
+		{
+			err:     NewErrBacklogOverflow(0, nil),
+			samples: smallSeriesSamples(newFailing(0, NewErrBacklogOverflow(0, nil))),
+			count:   true,
+		},
+		{
+			err:     NewErrBacklogOverflow(0, nil),
+			samples: smallSeriesSamples(newSlow(5 * time.Millisecond)),
+			count:   false,
+		},
+	} {
+		for _, sample := range errs.samples {
+			t.Run(
+				fmt.Sprintf("%s %T", sample.name, errs.err),
+				func(t *testing.T) {
+					count := int32(0)
+					w := NewConcurrentMultiWriter(
+						ConcurrentMultiWriterTestConfig,
+						func(err error) {
+							atomic.AddInt32(&count, 1)
+							assert.IsType(t, NewErrWriter(errs.err, nil), err)
+						},
+						sample.buffers...,
+					)
+					defer w.Close()
+
+					for _, v := range sample.data {
+						n, err := w.Write(v)
+
+						assert.Equal(t, nil, err, sample.name)
+						assert.Equal(t, len(v), n, sample.name)
+						assert.Equal(t, 0, len(w.preempt))
+					}
+
+					if errs.count {
+						assert.Equal(t, int32(len(sample.data)*len(sample.buffers)), count)
+					}
+				},
+			)
+		}
+	}
+}
+
 func TestConcurrentMultiWriterAddWrite(t *testing.T) {
 	var (
-		samples = smallSeriesSamples()
+		samples = smallSeriesSamples(newBuffer)
 	)
 
 	for _, sample := range samples {
@@ -176,30 +353,84 @@ func TestConcurrentMultiWriterAddWrite(t *testing.T) {
 			func(t *testing.T) {
 				w := NewConcurrentMultiWriter(
 					ConcurrentMultiWriterTestConfig,
-					func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
+					func(err error) { panic(err) },
 				)
 				defer w.Close()
+
+				testWrite := func(series [][]byte, buffers []io.Writer) {
+					for k, v := range series {
+						r := bytes.Join(series[:k+1], nil)
+						n, err := w.Write(v)
+
+						assert.Equal(t, nil, err)
+						assert.Equal(t, len(v), n)
+						assert.Equal(t, 0, len(w.preempt))
+
+						for _, buf := range buffers {
+							assert.Equal(
+								t,
+								r,
+								buf.(*bytes.Buffer).Bytes(),
+							)
+						}
+					}
+				}
 
 				for _, buf := range sample.buffers {
 					w.Add(buf)
 				}
+				testWrite(sample.data, sample.buffers)
+			},
+		)
+	}
+}
 
-				for k, v := range sample.data {
-					r := bytes.Join(sample.data[:k+1], nil)
-					n, err := w.Write(v)
+func TestConcurrentMultiWriterAddWriteRemoveAllAddWrite(t *testing.T) {
+	var (
+		samples = smallSeriesSamples(newBuffer)
+	)
 
-					assert.Equal(t, nil, err)
-					assert.Equal(t, len(v), n)
-					assert.Equal(t, 0, len(w.preemption))
+	for _, sample := range samples {
+		t.Run(
+			sample.name,
+			func(t *testing.T) {
+				w := NewConcurrentMultiWriter(
+					ConcurrentMultiWriterTestConfig,
+					func(err error) { panic(err) },
+				)
+				defer w.Close()
 
-					for _, buf := range sample.buffers {
-						assert.Equal(
-							t,
-							r,
-							buf.(*bytes.Buffer).Bytes(),
-						)
+				testWrite := func(series [][]byte, buffers []io.Writer) {
+					for k, v := range series {
+						r := bytes.Join(series[:k+1], nil)
+						n, err := w.Write(v)
+
+						assert.Equal(t, nil, err)
+						assert.Equal(t, len(v), n)
+						assert.Equal(t, 0, len(w.preempt))
+
+						for _, buf := range buffers {
+							assert.Equal(
+								t,
+								r,
+								buf.(*bytes.Buffer).Bytes(),
+							)
+						}
 					}
 				}
+
+				for _, buf := range sample.buffers {
+					w.Add(buf)
+				}
+				testWrite(sample.data, sample.buffers)
+
+				assert.Equal(t, w.RemoveAll(), len(sample.buffers) > 0)
+
+				newBuffers := replicateWriter(uint(len(sample.buffers)), newBuffer)
+				for _, buf := range newBuffers {
+					w.Add(buf)
+				}
+				testWrite(sample.data, newBuffers)
 			},
 		)
 	}
@@ -207,7 +438,7 @@ func TestConcurrentMultiWriterAddWrite(t *testing.T) {
 
 func TestConcurrentMultiWriterWriteRemoveWrite(t *testing.T) {
 	var (
-		samples = smallSeriesSamples()
+		samples = smallSeriesSamples(newBuffer)
 	)
 
 	for _, sample := range samples {
@@ -216,7 +447,7 @@ func TestConcurrentMultiWriterWriteRemoveWrite(t *testing.T) {
 			func(t *testing.T) {
 				w := NewConcurrentMultiWriter(
 					ConcurrentMultiWriterTestConfig,
-					func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
+					func(err error) { panic(err) },
 					sample.buffers...,
 				)
 				defer w.Close()
@@ -245,13 +476,13 @@ func TestConcurrentMultiWriterWriteRemoveWrite(t *testing.T) {
 						w.Remove(buf),
 					)
 				}
-				assert.Equal(t, 0, len(w.preemption))
+				assert.Equal(t, 0, len(w.preempt))
 
 				for _, v := range sample.data {
 					n, err := w.Write(v)
 					assert.Equal(t, nil, err)
 					assert.Equal(t, len(v), n)
-					assert.Equal(t, 0, len(w.preemption))
+					assert.Equal(t, 0, len(w.preempt))
 
 					for _, buf := range sample.buffers {
 						assert.Equal(
@@ -269,7 +500,7 @@ func TestConcurrentMultiWriterWriteRemoveWrite(t *testing.T) {
 
 func TestConcurrentMultiWriterAddWriteRemoveWrite(t *testing.T) {
 	var (
-		samples = smallSeriesSamples()
+		samples = smallSeriesSamples(newBuffer)
 	)
 
 	for _, sample := range samples {
@@ -278,7 +509,7 @@ func TestConcurrentMultiWriterAddWriteRemoveWrite(t *testing.T) {
 			func(t *testing.T) {
 				w := NewConcurrentMultiWriter(
 					ConcurrentMultiWriterTestConfig,
-					func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
+					func(err error) { panic(err) },
 				)
 				defer w.Close()
 
@@ -292,7 +523,7 @@ func TestConcurrentMultiWriterAddWriteRemoveWrite(t *testing.T) {
 
 					assert.Equal(t, nil, err)
 					assert.Equal(t, len(v), n)
-					assert.Equal(t, 0, len(w.preemption))
+					assert.Equal(t, 0, len(w.preempt))
 
 					for _, buf := range sample.buffers {
 						assert.Equal(
@@ -310,7 +541,7 @@ func TestConcurrentMultiWriterAddWriteRemoveWrite(t *testing.T) {
 						w.Remove(buf),
 					)
 				}
-				assert.Equal(t, 0, len(w.preemption))
+				assert.Equal(t, 0, len(w.preempt))
 
 				for _, v := range sample.data {
 					n, err := w.Write(v)
@@ -331,58 +562,9 @@ func TestConcurrentMultiWriterAddWriteRemoveWrite(t *testing.T) {
 }
 
 func BenchmarkConcurrentMultiWriter(b *testing.B) {
-	samples := []struct {
-		name string
-		w    io.WriteCloser
-	}{
-		{
-			name: "none",
-			w: NewConcurrentMultiWriter(
-				ConcurrentMultiWriterBenchConfig,
-				func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
-			),
-		},
-		{
-			name: "1",
-			w: NewConcurrentMultiWriter(
-				ConcurrentMultiWriterBenchConfig,
-				func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
-				replicateDiscard(1)...,
-			),
-		},
-		{
-			name: "2",
-			w: NewConcurrentMultiWriter(
-				ConcurrentMultiWriterBenchConfig,
-				func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
-				replicateDiscard(2)...,
-			),
-		},
-		{
-			name: "3",
-			w: NewConcurrentMultiWriter(
-				ConcurrentMultiWriterBenchConfig,
-				func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
-				replicateDiscard(3)...,
-			),
-		},
-		{
-			name: "512",
-			w: NewConcurrentMultiWriter(
-				ConcurrentMultiWriterBenchConfig,
-				func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
-				replicateDiscard(512)...,
-			),
-		},
-		{
-			name: "2048",
-			w: NewConcurrentMultiWriter(
-				ConcurrentMultiWriterBenchConfig,
-				func(w *ConcurrentMultiWriter, v io.Writer, err error) { panic(err) },
-				replicateDiscard(10000)...,
-			),
-		},
-	}
+	var (
+		samples = benchmarkingSeriesSamples(newDiscard)
+	)
 
 	for _, sample := range samples {
 		b.Run(
