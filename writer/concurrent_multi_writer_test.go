@@ -17,7 +17,7 @@ import (
 
 var (
 	ConcurrentMultiWriterTestConfig = ConcurrentMultiWriterConfig{
-		Backlog: BacklogConfig{Size: 0, AddTimeout: timeHelpers.Duration(10 * time.Millisecond)},
+		Backlog: BacklogConfig{Size: 2, AddTimeout: timeHelpers.Duration(10 * time.Millisecond)},
 		Pool: pool.Config{
 			Workers:   512,
 			QueueSize: 0,
@@ -132,6 +132,11 @@ func smallSeriesSamples(replicator func() io.Writer) concurrentMultiWriterSample
 		{
 			name:    "10:512",
 			data:    replicateByteslice(10, []byte(tearsInRain)),
+			buffers: replicateWriter(512, replicator),
+		},
+		{
+			name:    "100:512",
+			data:    replicateByteslice(100, []byte(tearsInRain)),
 			buffers: replicateWriter(512, replicator),
 		},
 	}
@@ -295,6 +300,56 @@ func TestConcurrentMultiWriterWrite(t *testing.T) {
 	}
 }
 
+func TestConcurrentMultiWriterConcurrentWrite(t *testing.T) {
+	var (
+		samples = smallSeriesSamples(newBuffer)
+	)
+
+	for _, sample := range samples {
+		t.Run(
+			sample.name,
+			func(t *testing.T) {
+				w := NewConcurrentMultiWriter(
+					ConcurrentMultiWriterTestConfig,
+					func(err error) { panic(err) },
+					sample.buffers...,
+				)
+				defer w.Close()
+
+				wg := &sync.WaitGroup{}
+				wg.Add(len(sample.data))
+				for _, v := range sample.data {
+					go func(v []byte) {
+						defer wg.Done()
+
+						n, err := w.Write(v)
+						assert.Equal(t, nil, err, sample.name)
+						assert.Equal(t, len(v), n, sample.name)
+					}(v)
+				}
+
+				wg.Wait()
+
+				assert.Equal(t, 0, len(w.preempt))
+
+				res := bytes.Join(sample.data, nil)
+				if len(res) == 0 {
+					res = nil
+				}
+
+				for k, buf := range sample.buffers {
+					assert.EqualValues(
+						t,
+						res,
+						buf.(*bytes.Buffer).Bytes(),
+						fmt.Sprintf("Buffer index is %d", k),
+					)
+				}
+			},
+		)
+	}
+}
+
 func TestConcurrentMultiWriterWriteErrors(t *testing.T) {
 	for _, errs := range []struct {
 		err     error
@@ -308,11 +363,6 @@ func TestConcurrentMultiWriterWriteErrors(t *testing.T) {
 			err: NewErrBacklogOverflow(0, nil),
 			samples: concurrentMultiWriterSamples{
 				// FIXME: Test with small values
-				{
-					name:    "2:2",
-					data:    replicateByteslice(2, []byte(tearsInRain)),
-					buffers: replicateWriter(2, newSlow(100*time.Millisecond)),
-				},
 				{
 					name:    "4:4",
 					data:    replicateByteslice(4, []byte(tearsInRain)),
@@ -587,15 +637,15 @@ func TestConcurrentMultiWriterAddWriteRemoveWrite(t *testing.T) {
 func BenchmarkConcurrentMultiWriter(b *testing.B) {
 	var (
 		samples = benchmarkingSeriesSamples(newDiscard)
+		payload = []byte(tearsInRain)
 	)
 
 	for _, sample := range samples {
 		b.Run(
 			sample.name,
 			func(b *testing.B) {
-				// run the Fib function b.N times
 				for n := 0; n < b.N; n++ {
-					_, err := sample.w.Write([]byte(tearsInRain))
+					_, err := sample.w.Write(payload)
 					if err != nil {
 						b.Error(err)
 					}
