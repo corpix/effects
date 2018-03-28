@@ -11,19 +11,20 @@ import (
 	"time"
 
 	"github.com/corpix/pool"
+	timeHelpers "github.com/corpix/time"
 	"github.com/stretchr/testify/assert"
 )
 
 var (
 	ConcurrentMultiWriterTestConfig = ConcurrentMultiWriterConfig{
-		Backlog: BacklogConfig{Size: 0, AddTimeout: 10 * time.Millisecond},
+		Backlog: BacklogConfig{Size: 0, AddTimeout: timeHelpers.Duration(10 * time.Millisecond)},
 		Pool: pool.Config{
 			Workers:   512,
 			QueueSize: 0,
 		},
 	}
 	ConcurrentMultiWriterBenchConfig = ConcurrentMultiWriterConfig{
-		Backlog: BacklogConfig{Size: 64, AddTimeout: 10 * time.Millisecond},
+		Backlog: BacklogConfig{Size: 64, AddTimeout: timeHelpers.Duration(10 * time.Millisecond)},
 		Pool: pool.Config{
 			Workers:   12048,
 			QueueSize: 1030,
